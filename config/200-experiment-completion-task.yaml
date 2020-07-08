@@ -1,0 +1,162 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: experiment-completion-task
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: target-namespace
+      description: namespace in which experiment is running
+      default: iter8-demo-project
+  resources:
+    inputs:
+      - name: git-source
+        type: git
+  results:
+    - name: state
+      description: The final state of the iter8 experiment
+  steps:
+    - name: wait
+      image: bitnami/kubectl:1.16
+      script: |
+        #!/bin/bash
+        EXPERIMENT_NAME=$(grep -m 1 name: /workspace/git-source/config/deploy.yaml | cut -f 2 -d ":" | xargs)
+        CLUSTER_NAMESPACE=$(params.target-namespace)
+        ACTIVITY_NAME="wait-experiment-completion"
+        STATUS_FILE="/status/done-${EXPERIMENT_NAME}"
+        if [ -f ${STATUS_FILE} ]; then rm -rf ${STATUS_FILE}; fi
+
+        # Constants
+        MAX_DURATION=$(( 59*60 ))
+        PHASE_COMPLETED="Completed"
+        CONDITION_EXPERIMENTSUCCEEDED="ExperimentSucceeded"
+        CONDITION_EXPERIMENTCOMPLETED="ExperimentCompleted"
+        BASELINE="baseline"
+        CANDIDATE="candidate"
+        OVERRIDE_FAILURE="override_failure"
+        OVERRIDE_SUCCESS="override_success"
+
+        # Default values if not set
+        SLEEP_TIME=${SLEEP_TIME:-5}
+        DURATION=${DURATION:-$(( 59*60 ))}
+        STATUS_FILE=${STATUS_FILE:-/dev/null}
+        # Validate ${DURARTION}
+        # If duration > 1 hr report warning in log and reset to 59 minutes
+        if (( ${DURATION} > ${MAX_DURATION} )); then
+            echo "WARNING: Unable to monitor rollout for more than 59 minutes"
+            echo "  Setting duration to 59 minutes"
+            DURATION=${MAX_DURATION}
+        fi
+
+        echo "   EXPERIMENT_NAME = $EXPERIMENT_NAME"
+        echo " CLUSTER_NAMESPACE = $CLUSTER_NAMESPACE"
+        echo "          DURATION = $DURATION"
+        echo "        SLEEP_TIME = $SLEEP_TIME"
+        echo "     ACTIVITY_NAME = $ACTIVITY_NAME"
+        echo "       STATUS_FILE = $STATUS_FILE"
+
+        get_experiment_phase() {
+          kubectl --namespace ${CLUSTER_NAMESPACE} \
+            get experiments.iter8.tools ${EXPERIMENT_NAME} \
+            -o jsonpath='{.status.phase}'
+        }
+
+        log() {
+          echo "$@"
+          echo "         Message: $(kubectl --namespace ${CLUSTER_NAMESPACE} \
+            get experiments.iter8.tools ${EXPERIMENT_NAME} \
+            --output jsonpath='{.status.message}')"
+          echo "      Assessment: $(kubectl --namespace ${CLUSTER_NAMESPACE} \
+            get experiments.iter8.tools ${EXPERIMENT_NAME} \
+            --output jsonpath='{.status.assessment.conclusions}')"
+        }
+
+        startS=$(date +%s)
+        timePassedS=0$(( $(date +%s) - $startS ))
+        while (( timePassedS < ${DURATION} )); do
+          sleep ${SLEEP_TIME}
+
+          phase=$(get_experiment_phase)
+          if [[ "${phase}" == "${PHASE_COMPLETED}" ]]; then
+            # experiment is done; delete appropriate version
+            # if baseline and candidate are the same then don't delete anything
+            _baseline=$(kubectl --namespace ${CLUSTER_NAMESPACE} get experiments.iter8.tools ${EXPERIMENT_NAME} -o jsonpath='{.spec.targetService.baseline}')
+            _candidate=$(kubectl --namespace ${CLUSTER_NAMESPACE} get experiments.iter8.tools ${EXPERIMENT_NAME} -o jsonpath='{.spec.targetService.candidate}')
+            echo "         _baseline = ${_baseline}"
+            echo "        _candidate = ${_candidate}"
+            if [[ "${_baseline}" == "${_candidate}" ]]; then
+              log "success" "Stage ${ACTIVITY_NAME} successfully completes"
+              touch ${STATUS_FILE}
+              echo -n success | tee $(results.state.path)
+              exit 0
+            fi
+
+            # To determine which version to delete: look at traffic split
+            _b_traffic=$(kubectl --namespace ${CLUSTER_NAMESPACE} get experiments.iter8.tools ${EXPERIMENT_NAME} -o jsonpath='{.status.trafficSplitPercentage.baseline}')
+            _c_traffic=$(kubectl --namespace ${CLUSTER_NAMESPACE} get experiments.iter8.tools ${EXPERIMENT_NAME} -o jsonpath='{.status.trafficSplitPercentage.candidate}')
+            echo " baseline traffic is ${_b_traffic}"
+            echo "candidate traffic is ${_c_traffic}"
+
+            # Select the one not receiving any traffic
+            _version_to_delete=
+            if (( ${_b_traffic} == 0 )); then _version_to_delete="$BASELINE";
+            elif (( ${_c_traffic} == 0 )); then _version_to_delete="$CANDIDATE";
+            else 
+              log "success" "Stage ${ACTIVITY_NAME} successfully completes"
+              touch ${STATUS_FILE}
+              echo -n success | tee $(results.state.path)
+              exit 0 # don't delete a version since traffic is still split
+            fi
+            echo "_version_to_delete = ${_version_to_delete}"
+
+            # Delete it
+            _deployment_to_delete=
+            if [[ "${_version_to_delete}" == "$BASELINE" ]]; then _deployment_to_delete=${_baseline};
+            elif [[ "${_version_to_delete}" == "$CANDIDATE" ]]; then _deployment_to_delete=${_candidate};
+            else _deployment_to_delete=${_candidate}; fi
+            if [[ -n ${_deployment_to_delete} ]]; then
+              kubectl --namespace ${CLUSTER_NAMESPACE} delete deployment ${_deployment_to_delete} --ignore-not-found
+            fi
+
+            # Read conditions
+            _succeeded=$(kubectl --namespace ${CLUSTER_NAMESPACE} \
+                        get experiments.iter8.tools ${EXPERIMENT_NAME} \
+                        --output jsonpath='{.status.conditions[?(@.type=="ExperimentSucceeded")].status}')
+            # Read reason from experiment 
+            _reason=$(kubectl --namespace ${CLUSTER_NAMESPACE} \
+                        get experiments.iter8.tools ${EXPERIMENT_NAME} \
+                        --output jsonpath='{.status.conditions[?(@.type=="Ready")].reason}')
+            echo "_reason=${_reason}"
+
+            # Handle experiment FAILURE
+            if [[ "${_succeeded}" == "False" ]]; then
+              log "failure" 'ROLLOUT CANDIDATE: Experiment failed'
+              echo -n failure | tee $(results.state.path)
+              exit 0
+
+            # Handle experiment SUCCESS
+            else
+
+              log "success" 'ROLLOUT CANDIDATE: Experiment succeeded'
+              touch ${STATUS_FILE}
+              echo -n success | tee $(results.state.path)
+              exit 0
+            fi
+
+          fi
+
+          timePassedS=$(( $(date +%s) - $startS ))
+        done
+
+        # We've waited ${DURATION} for the experiment to complete
+        # It hasn't, so we log warning and fail. User becomes responsible for cleanup?
+        echo "WARNING: ${ACTIVITY_NAME} did not complete experiment in ${DURATION}"
+        echo "   To check status of rollout: kubectl --namespace ${CLUSTER_NAMESPACE} experiments.iter8.tools ${EXPERIMENT_NAME}"
+        log "failure"  "WARNING: ${ACTIVITY_NAME} did not complete experiment in ${DURATION}s"
+        touch ${STATUS_FILE}
+        echo -n failure | tee $(results.state.path)
+        exit 0
+  workspaces:
+    - name: status
+      mountPath: /status
+
