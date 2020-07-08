@@ -1,0 +1,94 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: create-experiment-task
+  namespace: tekton-pipelines
+spec:
+  resources:
+    inputs:
+      - name: git-source
+        type: git
+  params:
+    - name: service-name
+      description: service name of the project application
+      default: iter8-demo
+    - name: target-namespace
+      description: namespace to which candidate will be deployed
+      default: iter8-demo-project
+  steps:
+    - name: identify-stable
+      image: linkyard/kubectl:1.14.2
+      script: |
+        #!/bin/bash
+        CANDIDATE_DEPLOYMENT_NAME=$(grep -m 1 name: /workspace/git-source/config/deploy.yaml | cut -f 2 -d ":" | xargs)
+        CLUSTER_NAMESPACE=$(params.target-namespace)
+
+        # Identify baseline deployment for an experiment
+        # This is heuristic; prefers to look at stable DestinationRule
+        # But if this isn't defined will select first deployment that satisfies
+        # the service selector (service from Experiment)
+
+        CONNECTOR='-'
+        NUM_DR=$(kubectl --namespace ${CLUSTER_NAMESPACE} get dr --selector=iter8${CONNECTOR}tools/role=stable --output json | jq '.items | length')
+        if (( ${NUM_DR} == 0 )); then
+          SERVICE=$(params.service-name)
+          DEPLOY_SELECTOR=$(kubectl --namespace ${CLUSTER_NAMESPACE} get svc ${SERVICE} --output json | jq -r '.spec.selector | to_entries[] | "\(.key)=\(.value)"' | paste -sd',' -)
+        else
+          DEPLOY_SELECTOR=$(kubectl --namespace ${CLUSTER_NAMESPACE} get dr --selector=iter8${CONNECTOR}tools/role=stable -o json | jq -r '.items[0].spec.subsets[] | select(.name == "stable") | .labels         | to_entries[] | "\(.key)=\(.value)"' | paste -sd',' -)
+        fi
+        echo "DEPLOY_SELECTOR=$DEPLOY_SELECTOR"
+        NUM_DEPLOY=$(kubectl --namespace ${CLUSTER_NAMESPACE} get deploy --selector=${DEPLOY_SELECTOR} --output json | jq '.items | length')
+
+        if (( ${NUM_DEPLOY} == 0 )); then
+          BASELINE_DEPLOYMENT_NAME=
+        else
+          BASELINE_DEPLOYMENT_NAME=$(kubectl --namespace ${CLUSTER_NAMESPACE} get deployment --selector=${DEPLOY_SELECTOR} --output jsonpath='{.items[0].metadata.name}') 
+        fi
+        echo "BASELINE_DEPLOYMENT_NAME=${BASELINE_DEPLOYMENT_NAME}"
+
+        # 
+
+        if [[ -z $BASELINE_DEPLOYMENT_NAME ]]; then BASELINE_DEPLOYMENT_NAME=$CANDIDATE_DEPLOYMENT_NAME; fi
+        # Create a version specific experiment name
+        EXPERIMENT_NAME=${CANDIDATE_DEPLOYMENT_NAME}
+        ON_SUCCESS=candidate
+
+        echo "EXPERIMENT_NAME=${EXPERIMENT_NAME}"
+        echo "BASELINE_DEPLOYMENT_NAME=${BASELINE_DEPLOYMENT_NAME}"
+        echo "CANDIDATE_DEPLOYMENT_NAME=${CANDIDATE_DEPLOYMENT_NAME}"
+        echo "ON_SUCCESS=${ON_SUCCESS}"
+        echo "ROLLOUT_DASHBOARD=${ROLLOUT_DASHBOARD}"
+        echo "CLUSTER_NAMESPACE=${CLUSTER_NAMESPACE}"
+
+        cat <<EOF | kubectl --namespace ${CLUSTER_NAMESPACE} apply --filename - || true
+        apiVersion: iter8.tools/v1alpha1
+        kind: Experiment 
+        metadata:
+          name: ${EXPERIMENT_NAME}
+        spec:
+          #routingReference:
+          #  apiVersion: networking.istio.io/v1alpha3
+          #  kind: VirtualService
+          #  name: demo-virtual-service
+          targetService:
+            name: $(inputs.params.service-name)
+            apiVersion: v1 
+            baseline: ${BASELINE_DEPLOYMENT_NAME}
+            candidate: ${CANDIDATE_DEPLOYMENT_NAME}
+          trafficControl:
+            strategy: check_and_increment
+            interval: 30s
+            trafficStepSize: 20
+            maxIterations: 8 #default value = 100
+            maxTrafficPercentage: 80 #default value = 50
+            onSuccess: ${ON_SUCCESS}
+          analysis:
+            analyticsService: "http://iter8-analytics.iter8:8080"
+            #grafanaEndpoint: ${ROLLOUT_DASHBOARD}
+            successCriteria:
+              - metricName: iter8_latency
+                toleranceType: threshold
+                tolerance: 0.2
+                sampleSize: 6
+        EOF
+

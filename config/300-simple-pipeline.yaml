@@ -1,0 +1,106 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: simple-pipeline
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: service
+    type: string
+    default: iter8-demo
+    description: service name
+  - name: namespace
+    type: string
+    default: iter8-demo-project
+    description: project name
+  - name: repo_full_name
+    default: ""
+    description: 
+  - name: sha
+    default: ""
+    description:
+  - name: request_url
+    default: ""
+    description:
+  - name: github_host_url
+    default: "api.github.com"
+    description:
+  - name: api_path_prefix
+    default: ""
+    description:
+  resources: 
+  - name: git-source
+    type: git
+  workspaces:
+  - name: status
+  tasks:
+  - name: generate-load
+    workspaces:
+    - name: status
+      workspace: status
+    taskRef:
+      name: generate-load-task
+    resources:
+      inputs:
+      - name: git-source
+        resource: git-source
+    params:
+    - name: target-namespace
+      value: $(params.namespace)
+  - name: iter8
+    params:
+    - name: service-name
+      value: $(params.service)
+    - name: target-namespace
+      value: $(params.namespace)
+    resources:
+      inputs:
+      - name: git-source
+        resource: git-source
+    taskRef: 
+      name: create-experiment-task
+  - name: deploy-simple
+    runAfter: [iter8]
+    params:
+    - name: target-namespace
+      value: $(params.namespace)
+    taskRef: 
+      name: deploy-simple-kubectl-task
+    resources: 
+      inputs:
+      - name: git-source
+        resource: git-source
+  - name: wait-experiment-completion
+    runAfter: [iter8]
+    workspaces:
+    - name: status
+      workspace: status
+    params:
+    - name: target-namespace
+      value: $(params.namespace)
+    resources:
+      inputs:
+      - name: git-source
+        resource: git-source
+    taskRef: 
+      name: experiment-completion-task
+  - name: github-set-status
+    runAfter: [wait-experiment-completion]
+    params:
+    - name: GITHUB_HOST_URL
+      value: $(params.github_host_url)
+    - name: API_PATH_PREFIX
+      value: $(params.api_path_prefix)
+    - name: REPO_FULL_NAME
+      value: $(params.repo_full_name)
+    - name: SHA
+      value: $(params.sha)
+    - name: DESCRIPTION
+      value: "$(tasks.wait-experiment-completion.results.state)"
+    - name: STATE
+      value: "$(tasks.wait-experiment-completion.results.state)"
+    - name: TARGET_URL
+      value: $(params.request_url)
+    taskRef:
+      kind: Task
+      name: github-set-status

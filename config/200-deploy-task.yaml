@@ -1,0 +1,21 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: deploy-simple-kubectl-task
+  namespace: tekton-pipelines
+spec:
+  resources:
+    inputs:
+      - name: git-source
+        type: git
+  params:
+  - name: target-namespace
+    type: string
+    description: namespace in which to apply the yaml
+    default: iter8-demo-project
+  steps:
+  - name: install-new
+    image: lachlanevenson/k8s-kubectl
+    script: |
+      #!/bin/sh
+      kubectl apply -f ./git-source/config -n $(params.target-namespace)

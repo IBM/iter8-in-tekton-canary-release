@@ -1,0 +1,160 @@
+apiVersion: triggers.tekton.dev/v1alpha1
+kind: EventListener
+metadata:
+  name: demo-eventlistener
+  namespace: tekton-pipelines
+spec:
+  serviceAccountName: demo
+  serviceType: NodePort
+  triggers:
+  - name: sample-pipelines-event
+    bindings:
+    - apiversion: v1alpha1
+      kind: TriggerBinding
+      name: simple-pipeline-binding
+    - apiversion: v1alpha1
+      kind: TriggerBinding
+      name: simple-pipeline-user-binding
+    template:
+      apiversion: v1alpha1
+      name: simple-pipeline-template
+    interceptors:
+    - cel:
+        filter: >-
+          (header.match('X-GitHub-Event', 'push') &&
+           body.ref == 'refs/heads/master')
+
+---
+
+apiVersion: triggers.tekton.dev/v1alpha1
+kind: TriggerBinding
+metadata:
+  name: simple-pipeline-binding
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: gitrevision
+    value: $(body.after)
+  - name: gitrepositoryurl
+    value: $(body.repository.clone_url)
+  - name: event-type
+    value: $(header.X-Github-Event)
+  - name: repo_full_name
+    value: $(body.repository.full_name)
+  - name: sha
+    value: $(body.after)
+
+---
+
+apiVersion: triggers.tekton.dev/v1alpha1
+kind: TriggerTemplate
+metadata:
+  name: simple-pipeline-template
+  namespace: tekton-pipelines
+spec:
+  params:
+  - description: The revision of your Git repository
+    name: gitrevision
+  - description: The url of your Git repository
+    name: gitrepositoryurl
+  - description: The Git event type
+    name: event-type
+  - description: The ServiceAccount that the PipelineRun will execute under
+    name: service-account
+    default: demo
+  - description: The namespace in which to deploy the app
+    name: namespace
+    default: iter8-demo-project
+  - name: service
+    default: iter8-demo
+    description: service name
+  - name: repo_full_name
+    default: ""
+    description: 
+  - name: sha
+    default: ""
+    description:
+  - name: request_url
+    default: ""
+    description:
+  - name: github_host_url
+    default: "api.github.com"
+    description:
+  - name: api_path_prefix
+    default: ""
+    description:
+
+  resourcetemplates:
+  - apiVersion: tekton.dev/v1alpha1
+    kind: PipelineResource
+    metadata:
+      name: git-source-$(uid)
+      namespace: tekton-pipelines
+    spec:
+      params:
+      - name: revision
+        value: $(params.gitrevision)
+      - name: url
+        value: $(params.gitrepositoryurl)
+      type: git
+  - apiVersion: tekton.dev/v1beta1
+    kind: PipelineRun
+    metadata:
+      generateName: simple-pipeline-run-
+      namespace: tekton-pipelines
+    spec:
+      params:
+      - name: event-type
+        value: $(params.event-type)
+      - name: service
+        value: $(params.service)
+      - name: namespace
+        value: $(params.namespace)
+      - name: repo_full_name
+        value: $(params.repo_full_name)
+      - name: sha
+        value: $(params.sha)
+      - name: request_url
+        value: $(params.request_url)
+      - name: github_host_url
+        value: $(params.github_host_url)
+      - name: api_path_prefix
+        value: $(params.api_path_prefix)
+      pipelineRef:
+        name: simple-pipeline
+      resources:
+      - name: git-source
+        resourceRef:
+          name: git-source-$(uid)
+      serviceAccountName: $(params.service-account)
+      workspaces:
+      - name: status
+        volumeClaimTemplate:
+          metadata:
+            name: iter8-demo-pvc
+          spec:
+            accessModes:
+              - ReadWriteMany
+            resources:
+              requests:
+                storage: 1Mi
+
+---
+
+kind: Route
+apiVersion: route.openshift.io/v1
+metadata:
+  name: iter8-demo
+  namespace: tekton-pipelines
+  labels:
+    app.kubernetes.io/managed-by: EventListener
+    app.kubernetes.io/part-of: Triggers
+    eventlistener: demo-eventlistener
+spec:
+  to:
+    kind: Service
+    name: el-demo-eventlistener
+    weight: 100
+  port:
+    targetPort: http-listener
+  wildcardPolicy: None
